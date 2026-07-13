@@ -242,9 +242,24 @@ class AudioExportJob:
         stretch = 1/a , offset = -b/a , target duration = A's video duration.
 
     Two passes are used deliberately: combining tempo change and delay/trim in
-    a single filtergraph produced incorrect timestamps, so pass 1 handles
-    tempo/pitch (+ optional loudnorm) and pass 2 handles offset + pad/trim.
+    a single filtergraph produced incorrect timestamps.
+
+    Pass 1 always applies tempo/pitch (+ optional loudnorm). Pass 2 applies the
+    offset and pad/trim to the exact target duration.
+
+    For "streamable" bitstream codecs (aac/mp3/ac3), pass 1 encodes straight to
+    the final codec and pass 2 does pad/trim with stream copy (no second
+    encode): silence segments are generated in the same codec and joined with
+    ffmpeg's `concat:` protocol, front trims use `-ss -c copy`, and the total
+    is capped with `-t`. For container formats (opus/flac/pcm) copy-concat is
+    not reliable, so pass 1 renders a lossless PCM intermediate and pass 2
+    re-encodes once through the offset/pad filtergraph.
     """
+
+    # Raw bitstream codecs that survive stream-copy trim + concat protocol.
+    # Maps encoder name -> raw file extension used for intermediates.
+    STREAMABLE = {"aac": ".aac", "libmp3lame": ".mp3", "ac3": ".ac3"}
+    CHANNEL_LAYOUT = {1: "mono", 2: "stereo", 6: "5.1"}
 
     def __init__(self, src_path, src_audio_index, stretch, offset,
                  target_duration, out_path, *, preserve_pitch=True,
@@ -284,7 +299,8 @@ class AudioExportJob:
                 pass
 
     # --- filter construction ----------------------------------------------
-    def _pass1_filter(self, sr):
+    def _tempo_filter(self, sr):
+        """Filter chain for tempo/pitch change (+ optional normalize)."""
         f = []
         if self.preserve_pitch:
             f += atempo_chain(1.0 / self.stretch)
@@ -297,7 +313,8 @@ class AudioExportJob:
         f.append(f"aresample={sr}")
         return ",".join(f)
 
-    def _pass2_filter(self):
+    def _offset_padtrim_filter(self):
+        """Filter chain (re-encode path) for offset + pad/trim to target."""
         f = []
         ms = int(round(self.offset * 1000))
         if ms > 0:
@@ -322,45 +339,125 @@ class AudioExportJob:
             self.log_cb(f"# stretch factor: {self.stretch:.6f}   "
                         f"offset: {self.offset:+.6f} s   "
                         f"target: {self.target_duration:.3f} s\n")
+            self.log_cb(f"# codec: {self.codec}   channels: {self.channels}\n")
 
-            fd, mid = tempfile.mkstemp(suffix=".wav", prefix="vsync_mid_")
-            os.close(fd)
-            self._tmpfiles.append(mid)
-
-            # Pass 1: tempo/pitch (+normalize) into a lossless intermediate.
-            cmd1 = [
-                FFMPEG, "-hide_banner", "-y",
-                "-i", self.src_path,
-                "-map", f"0:a:{self.src_audio_index}",
-                "-af", self._pass1_filter(sr),
-                "-c:a", "pcm_s16le",
-                mid,
-            ]
-            if not self._run_ffmpeg(cmd1, "PASS 1/2  (tempo / pitch"
-                                          + (" + normalize" if self.normalize
-                                             else "") + ")"):
+            if self.codec in self.STREAMABLE:
+                ok = self._run_streamcopy(sr)
+            else:
+                ok = self._run_reencode(sr)
+            if not ok:
+                # _run_ffmpeg already reported the failure/cancellation.
+                self._cleanup_tmp()
                 return
-
-            # Pass 2: offset + pad/trim, encode to the chosen codec.
-            cmd2 = [
-                FFMPEG, "-hide_banner", "-y",
-                "-i", mid,
-                "-af", self._pass2_filter(),
-                "-c:a", self.codec,
-                "-ac", str(self.channels),
-            ]
-            if self.codec != "flac":  # flac ignores bitrate
-                cmd2 += ["-b:a", self.bitrate]
-            cmd2 += [self.out_path]
-            if not self._run_ffmpeg(cmd2, "PASS 2/2  (offset + pad/trim + encode)"):
-                return
-
             self._cleanup_tmp()
             self.done_cb(True, f"Saved: {self.out_path}")
         except Exception as exc:  # noqa: BLE001
             self._cleanup_tmp()
             self.log_cb(f"\n[error] {exc}\n")
             self.done_cb(False, str(exc))
+
+    def _mktemp(self, suffix):
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix="vsync_")
+        os.close(fd)
+        self._tmpfiles.append(path)
+        return path
+
+    def _run_reencode(self, sr):
+        """Container-format path: PCM intermediate, then one filtered encode."""
+        mid = self._mktemp(".wav")
+        cmd1 = [
+            FFMPEG, "-hide_banner", "-y",
+            "-i", self.src_path,
+            "-map", f"0:a:{self.src_audio_index}",
+            "-af", self._tempo_filter(sr),
+            "-c:a", "pcm_s16le",
+            mid,
+        ]
+        if not self._run_ffmpeg(cmd1, "PASS 1/2  (tempo / pitch"
+                                + (" + normalize" if self.normalize else "")
+                                + ")"):
+            return False
+
+        cmd2 = [
+            FFMPEG, "-hide_banner", "-y",
+            "-i", mid,
+            "-af", self._offset_padtrim_filter(),
+            "-c:a", self.codec,
+            "-ac", str(self.channels),
+        ]
+        if self.codec != "flac":  # flac ignores bitrate
+            cmd2 += ["-b:a", self.bitrate]
+        cmd2 += [self.out_path]
+        return self._run_ffmpeg(cmd2, "PASS 2/2  (offset + pad/trim + encode)")
+
+    def _run_streamcopy(self, sr):
+        """Streamable path: encode once, then pad/trim with stream copy."""
+        ext = self.STREAMABLE[self.codec]
+
+        # Pass 1: tempo/pitch (+normalize) straight to the final codec.
+        main = self._mktemp(ext)
+        cmd1 = [
+            FFMPEG, "-hide_banner", "-y",
+            "-i", self.src_path,
+            "-map", f"0:a:{self.src_audio_index}",
+            "-af", self._tempo_filter(sr),
+            "-c:a", self.codec,
+            "-ac", str(self.channels),
+            "-b:a", self.bitrate,
+            main,
+        ]
+        if not self._run_ffmpeg(cmd1, "PASS 1/2  (tempo / pitch"
+                                + (" + normalize" if self.normalize else "")
+                                + " -> " + self.codec + ")"):
+            return False
+
+        # Front handling: positive offset -> prepend silence; negative -> trim.
+        parts = []
+        if self.offset > 0.0005:
+            front = self._mktemp(ext)
+            if not self._make_silence(front, self.offset, sr, ext):
+                return False
+            parts.append(front)
+            parts.append(main)
+        elif self.offset < -0.0005:
+            trimmed = self._mktemp(ext)
+            cmd = [FFMPEG, "-hide_banner", "-y",
+                   "-ss", f"{-self.offset:.6f}", "-i", main,
+                   "-c", "copy", trimmed]
+            if not self._run_ffmpeg(cmd, "PASS 2/3  (front trim, stream copy)"):
+                return False
+            parts.append(trimmed)
+        else:
+            parts.append(main)
+
+        # Tail: append generous silence so we can always cap to the target.
+        # (concat + -t caps exactly; extra silence is discarded.)
+        tail = self._mktemp(ext)
+        if not self._make_silence(tail, self.target_duration, sr, ext):
+            return False
+        parts.append(tail)
+
+        # Final: concat all parts and cap to the exact target duration by copy.
+        cmd = [FFMPEG, "-hide_banner", "-y",
+               "-t", f"{self.target_duration:.6f}",
+               "-i", "concat:" + "|".join(parts),
+               "-c", "copy", self.out_path]
+        return self._run_ffmpeg(cmd,
+                                "PASS 3/3  (pad + cap to target, stream copy)")
+
+    def _make_silence(self, path, duration, sr, ext):
+        layout = self.CHANNEL_LAYOUT.get(self.channels, "stereo")
+        cmd = [
+            FFMPEG, "-hide_banner", "-y",
+            "-f", "lavfi",
+            "-i", f"anullsrc=channel_layout={layout}:sample_rate={sr}",
+            "-t", f"{duration:.6f}",
+            "-c:a", self.codec,
+            "-ac", str(self.channels),
+            "-b:a", self.bitrate,
+            path,
+        ]
+        return self._run_ffmpeg(cmd, f"  (silence {duration:.3f}s)")
 
     def _run_ffmpeg(self, cmd, title):
         if self._cancelled.is_set():
