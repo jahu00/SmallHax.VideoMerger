@@ -686,6 +686,9 @@ class VideoPlayer:
 # UI panel for a single video
 # ----------------------------------------------------------------------------
 class VideoPanel(ttk.Frame):
+    BORDER_IDLE = "#333333"      # unselected panel border
+    BORDER_ACTIVE = "#3b82f6"    # selected panel border (blue)
+
     def __init__(self, master, app, title):
         super().__init__(master, padding=6)
         self.app = app
@@ -713,7 +716,12 @@ class VideoPanel(ttk.Frame):
 
         # Container that expands to fill available space; the video Label is
         # centered inside it. We measure this container to size the decode.
-        self.video_area = tk.Frame(self, background="black", height=270)
+        # A colored highlight border indicates which panel is selected.
+        self.video_area = tk.Frame(
+            self, background="black", height=270,
+            highlightthickness=3, highlightbackground=self.BORDER_IDLE,
+            highlightcolor=self.BORDER_IDLE,
+        )
         self.video_area.pack(pady=4, fill="both", expand=True)
         self.video_area.pack_propagate(False)
         self.canvas = tk.Label(self.video_area, background="black")
@@ -725,6 +733,11 @@ class VideoPanel(ttk.Frame):
                 justify="center",
             )
             self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        # Clicking anywhere on the video selects this panel.
+        for w in (self.video_area, self.canvas,
+                  getattr(self, "placeholder", None)):
+            if w is not None:
+                w.bind("<Button-1>", lambda e: self._select(), add="+")
         self.video_area.bind("<Configure>", self._on_area_resize)
         self._resize_job = None
         self._last_box = (0, 0)
@@ -738,7 +751,8 @@ class VideoPanel(ttk.Frame):
         )
         self.slider.pack(fill="x")
         self._slider_active = False
-        self.slider.bind("<ButtonPress-1>", lambda e: self._set_slider_active(True))
+        self.slider.bind("<ButtonPress-1>",
+                         lambda e: (self._select(), self._set_slider_active(True)))
         self.slider.bind("<ButtonRelease-1>", self._on_slider_release)
 
         self.info_var = tk.StringVar(value="frame 0 / 0    t=0.000s")
@@ -766,6 +780,16 @@ class VideoPanel(ttk.Frame):
         ttk.Button(row3, text="Mark 2", command=lambda: self.mark(2)).pack(side="left", padx=1)
         self.mark_var = tk.StringVar(value="mark1: -    mark2: -")
         ttk.Label(self, textvariable=self.mark_var).pack()
+
+    # --- selection ---------------------------------------------------------
+    def _select(self):
+        """Make this panel the active one for keyboard shortcuts."""
+        self.app.select_panel(self)
+
+    def set_selected(self, selected):
+        color = self.BORDER_ACTIVE if selected else self.BORDER_IDLE
+        self.video_area.configure(highlightbackground=color,
+                                  highlightcolor=color)
 
     # --- helpers -----------------------------------------------------------
     def _set_slider_active(self, val):
@@ -796,6 +820,7 @@ class VideoPanel(ttk.Frame):
         self.name_var.set(path.rsplit("/", 1)[-1])
         if getattr(self, "placeholder", None) is not None:
             self.placeholder.place_forget()
+        self._select()
         self._populate_audio_tracks()
         self.slider.configure(to=max(self.player.total_frames - 1, 1))
         self.mark1 = self.mark2 = None
@@ -811,13 +836,21 @@ class VideoPanel(ttk.Frame):
         self._update_info()
 
     def play(self):
+        self._select()
         if self.loaded():
             self.player.playing = True
 
     def pause(self):
+        self._select()
         self.player.playing = False
 
+    def toggle_play(self):
+        self._select()
+        if self.loaded():
+            self.player.playing = not self.player.playing
+
     def stop(self):
+        self._select()
         if not self.loaded():
             return
         self.player.playing = False
@@ -826,6 +859,7 @@ class VideoPanel(ttk.Frame):
         self._update_info()
 
     def step_forward(self):
+        self._select()
         if not self.loaded():
             return
         self.player.playing = False
@@ -833,6 +867,7 @@ class VideoPanel(ttk.Frame):
         self._update_info()
 
     def step_back(self):
+        self._select()
         if not self.loaded():
             return
         self.player.playing = False
@@ -842,6 +877,7 @@ class VideoPanel(ttk.Frame):
         self._update_info()
 
     def _jump_frames(self, delta):
+        self._select()
         if not self.loaded():
             return
         self.player.playing = False
@@ -877,6 +913,7 @@ class VideoPanel(ttk.Frame):
         self._update_info()
 
     def mark(self, which):
+        self._select()
         if not self.loaded():
             return
         if which == 1:
@@ -1167,6 +1204,11 @@ class App(ttk.Frame):
         self.right = VideoPanel(panels, self, "Video B  (y / right timeline)")
         self.right.pack(side="left", fill="both", expand=True, padx=4)
 
+        # Video A starts selected.
+        self.selected = self.left
+        self.left.set_selected(True)
+        self.right.set_selected(False)
+
         self._build_menu(master)
 
         # coefficient panel
@@ -1179,16 +1221,12 @@ class App(ttk.Frame):
 
         self._build_export_controls(coef)
 
-        # keyboard shortcuts
-        master.bind("<Left>", lambda e: self.left.step_back())
-        master.bind("<Right>", lambda e: self.left.step_forward())
-        master.bind("<Shift-Left>", lambda e: self.left.rewind())
-        master.bind("<Shift-Right>", lambda e: self.left.fast_forward())
-        master.bind("<comma>", lambda e: self.right.step_back())
-        master.bind("<period>", lambda e: self.right.step_forward())
-        master.bind("<less>", lambda e: self.right.rewind())
-        master.bind("<greater>", lambda e: self.right.fast_forward())
-        master.bind("<space>", self._toggle_both)
+        # keyboard shortcuts act on the currently selected panel
+        master.bind("<Left>", lambda e: self.selected.step_back())
+        master.bind("<Right>", lambda e: self.selected.step_forward())
+        master.bind("<Shift-Left>", lambda e: self.selected.rewind())
+        master.bind("<Shift-Right>", lambda e: self.selected.fast_forward())
+        master.bind("<space>", self._on_space)
 
         self.coef_a = None
         self.coef_b = None
@@ -1300,11 +1338,17 @@ class App(ttk.Frame):
         for panel in (self.left, self.right):
             panel.player.close()
 
-    def _toggle_both(self, _event=None):
-        want = not (self.left.player.playing or self.right.player.playing)
-        for panel in (self.left, self.right):
-            if panel.loaded():
-                panel.player.playing = want
+    def select_panel(self, panel):
+        if panel is self.selected:
+            return
+        self.selected = panel
+        self.left.set_selected(panel is self.left)
+        self.right.set_selected(panel is self.right)
+
+    def _on_space(self, _event=None):
+        # Space toggles play/pause on the selected panel only.
+        self.selected.toggle_play()
+        return "break"
 
     def _schedule_tick(self):
         if not self._alive:
